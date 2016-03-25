@@ -17,6 +17,9 @@
 
 package org.apache.spark.sql.execution.columnar
 
+import java.nio.{ByteBuffer, ByteOrder}
+import java.nio.ByteOrder.nativeOrder
+
 import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.{Accumulable, Accumulator, Accumulators}
@@ -31,7 +34,7 @@ import org.apache.spark.sql.catalyst.plans.logical.Statistics
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.execution.{LeafExecNode, SparkPlan}
 import org.apache.spark.sql.execution.metric.SQLMetrics
-import org.apache.spark.sql.types.UserDefinedType
+import org.apache.spark.sql.types._
 import org.apache.spark.storage.StorageLevel
 
 private[sql] object InMemoryRelation {
@@ -52,7 +55,35 @@ private[sql] object InMemoryRelation {
  * @param stats The stat of columns
  */
 private[columnar]
-case class CachedBatch(numRows: Int, buffers: Array[Array[Byte]], stats: InternalRow)
+case class CachedBatch(numRows: Int, buffers: Array[Array[Byte]],
+                       dataTypes: Array[DataType], stats: InternalRow) {
+  def column(ordinal: Int): org.apache.spark.sql.execution.vectorized.ColumnVector = {
+    val dt = dataTypes(ordinal)
+    val buffer = ByteBuffer.wrap(buffers(ordinal)).order(nativeOrder)
+    val accessor: BasicColumnAccessor[_] = dt match {
+      case BooleanType => new BooleanColumnAccessor(buffer)
+      case ByteType => new ByteColumnAccessor(buffer)
+      case ShortType => new ShortColumnAccessor(buffer)
+      case IntegerType | DateType => new IntColumnAccessor(buffer)
+      case LongType | TimestampType => new LongColumnAccessor(buffer)
+      case FloatType => new FloatColumnAccessor(buffer)
+      case DoubleType => new DoubleColumnAccessor(buffer)
+    }
+
+    val (out, nullsBuffer) = if (accessor.isInstanceOf[NativeColumnAccessor[_]]) {
+      val nativeAccessor = accessor.asInstanceOf[NativeColumnAccessor[_]]
+      nativeAccessor.decompress(numRows);
+    } else {
+      val buffer = accessor.getByteBuffer
+      val nullsBuffer = buffer.duplicate().order(ByteOrder.nativeOrder())
+      nullsBuffer.rewind()
+      (buffer, nullsBuffer)
+    }
+
+    org.apache.spark.sql.execution.vectorized.ColumnVector.allocate(numRows, dt,
+      true, out, nullsBuffer)
+  }
+}
 
 private[sql] case class InMemoryRelation(
     output: Seq[Attribute],
@@ -135,6 +166,7 @@ private[sql] case class InMemoryRelation(
           val columnBuilders = output.map { attribute =>
             ColumnBuilder(attribute.dataType, batchSize, attribute.name, useCompression)
           }.toArray
+          val columnTypes = output.map { attribute => attribute.dataType }.toArray
 
           var rowCount = 0
           var totalSize = 0L
@@ -168,7 +200,7 @@ private[sql] case class InMemoryRelation(
           batchStats += stats
           CachedBatch(rowCount, columnBuilders.map { builder =>
             JavaUtils.bufferToArray(builder.build())
-          }, stats)
+          }, columnTypes, stats)
         }
 
         def hasNext: Boolean = rowIterator.hasNext
@@ -309,9 +341,9 @@ private[sql] case class InMemoryTableScanExec(
         schema)
 
       // Find the ordinals and data types of the requested columns.
-      val (requestedColumnIndices, requestedColumnDataTypes) =
+      val (requestedColumnIndices, requestedColumnAttribute) =
         attributes.map { a =>
-          relOutput.indexWhere(_.exprId == a.exprId) -> a.dataType
+          relOutput.indexWhere(_.exprId == a.exprId) -> a
         }.unzip
 
       // Do partition batch pruning if enabled
@@ -343,12 +375,16 @@ private[sql] case class InMemoryTableScanExec(
         batch
       }
 
-      val columnTypes = requestedColumnDataTypes.map {
-        case udt: UserDefinedType[_] => udt.sqlType
-        case other => other
+      val columnTypes = requestedColumnAttribute.map { a =>
+        a.dataType match {
+          case udt: UserDefinedType[_] => udt.sqlType
+          case other => other
+        }
       }.toArray
+      val columnNullables = requestedColumnAttribute.map { _.nullable }.toArray
       val columnarIterator = GenerateColumnAccessor.generate(columnTypes)
-      columnarIterator.initialize(withMetrics, columnTypes, requestedColumnIndices.toArray)
+      columnarIterator.initialize(withMetrics, columnTypes, requestedColumnIndices.toArray,
+        columnNullables)
       if (enableAccumulators && columnarIterator.hasNext) {
         readPartitions += 1
       }
