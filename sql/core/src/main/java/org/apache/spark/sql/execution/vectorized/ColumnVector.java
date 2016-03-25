@@ -18,6 +18,7 @@ package org.apache.spark.sql.execution.vectorized;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.nio.ByteBuffer;
 
 import org.apache.commons.lang.NotImplementedException;
 import org.apache.parquet.column.Dictionary;
@@ -68,6 +69,11 @@ public abstract class ColumnVector implements AutoCloseable {
     } else {
       return new OnHeapColumnVector(capacity, type);
     }
+  }
+
+  public static ColumnVector allocate(int capacity, DataType type,
+    boolean isConstant, ByteBuffer buffer, ByteBuffer nullsBuffer) {
+    return new ByteBufferColumnVector(capacity, type, isConstant, buffer, nullsBuffer);
   }
 
   /**
