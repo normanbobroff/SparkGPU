@@ -544,6 +544,7 @@ case class TungstenAggregate(
      if (!$initAgg) {
        $initAgg = true;
        long $beforeAgg = System.nanoTime();
+       $hashMapTerm = $thisPlan.createHashMap();
        $doAgg();
        $aggTime.add((System.nanoTime() - $beforeAgg) / 1000000);
      }
