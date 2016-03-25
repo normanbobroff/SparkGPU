@@ -386,6 +386,7 @@ case class RangeExec(
        """.stripMargin)
 
     val input = ctx.freshName("input")
+    ctx.inputHolder = input
     // Right now, Range is only used when there is one upstream.
     ctx.addMutableState("scala.collection.Iterator", input, s"$input = inputs[0];")
     s"""
