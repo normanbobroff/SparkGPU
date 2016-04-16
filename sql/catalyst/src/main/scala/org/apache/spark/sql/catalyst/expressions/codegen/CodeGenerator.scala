@@ -179,6 +179,7 @@ class CodegenContext {
   var isRow = true
   var enableColumnCodeGen = false
   var inputHolder = ""
+  val columnarItrName = "columnar_iterator"
   val columnarBatchName = "columnar_batch"
   val columnarBatchIdxName = "columnar_batchIdx"
 
