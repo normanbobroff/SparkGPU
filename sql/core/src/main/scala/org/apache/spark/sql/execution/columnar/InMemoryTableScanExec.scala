@@ -341,9 +341,9 @@ private[sql] case class InMemoryTableScanExec(
         schema)
 
       // Find the ordinals and data types of the requested columns.
-      val (requestedColumnIndices, requestedColumnAttribute) =
+      val (requestedColumnIndices, requestedColumnDataTypes) =
         attributes.map { a =>
-          relOutput.indexWhere(_.exprId == a.exprId) -> a
+          relOutput.indexWhere(_.exprId == a.exprId) -> a.dataType
         }.unzip
 
       // Do partition batch pruning if enabled
@@ -375,16 +375,12 @@ private[sql] case class InMemoryTableScanExec(
         batch
       }
 
-      val columnTypes = requestedColumnAttribute.map { a =>
-        a.dataType match {
-          case udt: UserDefinedType[_] => udt.sqlType
-          case other => other
-        }
+      val columnTypes = requestedColumnDataTypes.map {
+        case udt: UserDefinedType[_] => udt.sqlType
+        case other => other
       }.toArray
-      val columnNullables = requestedColumnAttribute.map { _.nullable }.toArray
       val columnarIterator = GenerateColumnAccessor.generate(columnTypes)
-      columnarIterator.initialize(withMetrics, columnTypes, requestedColumnIndices.toArray,
-        columnNullables)
+      columnarIterator.initialize(withMetrics, columnTypes, requestedColumnIndices.toArray)
       if (enableAccumulators && columnarIterator.hasNext) {
         readPartitions += 1
       }
