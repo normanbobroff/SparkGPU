@@ -55,12 +55,11 @@ private[sql] object InMemoryRelation {
  * @param stats The stat of columns
  */
 private[columnar]
-case class CachedBatch(numRows: Int, buffers: Array[Array[Byte]],
-                       dataTypes: Array[DataType], stats: InternalRow) {
-  def column(ordinal: Int): org.apache.spark.sql.execution.vectorized.ColumnVector = {
-    val dt = dataTypes(ordinal)
+case class CachedBatch(numRows: Int, buffers: Array[Array[Byte]], stats: InternalRow) {
+  def column(ordinal: Int, dataType: DataType):
+    org.apache.spark.sql.execution.vectorized.ColumnVector = {
     val buffer = ByteBuffer.wrap(buffers(ordinal)).order(nativeOrder)
-    val accessor: BasicColumnAccessor[_] = dt match {
+    val accessor: BasicColumnAccessor[_] = dataType match {
       case BooleanType => new BooleanColumnAccessor(buffer)
       case ByteType => new ByteColumnAccessor(buffer)
       case ShortType => new ShortColumnAccessor(buffer)
@@ -80,8 +79,8 @@ case class CachedBatch(numRows: Int, buffers: Array[Array[Byte]],
       (buffer, nullsBuffer)
     }
 
-    org.apache.spark.sql.execution.vectorized.ColumnVector.allocate(numRows, dt,
-      true, out, nullsBuffer)
+    org.apache.spark.sql.execution.vectorized.ColumnVector.allocate(
+      numRows, dataType, true, out, nullsBuffer)
   }
 }
 
@@ -166,7 +165,6 @@ private[sql] case class InMemoryRelation(
           val columnBuilders = output.map { attribute =>
             ColumnBuilder(attribute.dataType, batchSize, attribute.name, useCompression)
           }.toArray
-          val columnTypes = output.map { attribute => attribute.dataType }.toArray
 
           var rowCount = 0
           var totalSize = 0L
@@ -200,7 +198,7 @@ private[sql] case class InMemoryRelation(
           batchStats += stats
           CachedBatch(rowCount, columnBuilders.map { builder =>
             JavaUtils.bufferToArray(builder.build())
-          }, columnTypes, stats)
+          }, stats)
         }
 
         def hasNext: Boolean = rowIterator.hasNext
