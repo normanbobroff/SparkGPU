@@ -34,6 +34,7 @@ import org.apache.spark.sql.catalyst.plans.logical.Statistics
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.execution.{LeafExecNode, SparkPlan}
 import org.apache.spark.sql.execution.metric.SQLMetrics
+import org.apache.spark.sql.execution.vectorized.ColumnVector
 import org.apache.spark.sql.types._
 import org.apache.spark.storage.StorageLevel
 
@@ -56,8 +57,9 @@ private[sql] object InMemoryRelation {
  */
 private[columnar]
 case class CachedBatch(numRows: Int, buffers: Array[Array[Byte]], stats: InternalRow) {
-  def column(ordinal: Int, dataType: DataType):
-    org.apache.spark.sql.execution.vectorized.ColumnVector = {
+  def column(columnarIterator: ColumnarIterator, index: Int): ColumnVector = {
+    val ordinal = columnarIterator.getColumnIndexes(index)
+    val dataType = columnarIterator.getColumnTypes(index)
     val buffer = ByteBuffer.wrap(buffers(ordinal)).order(nativeOrder)
     val accessor: BasicColumnAccessor[_] = dataType match {
       case BooleanType => new BooleanColumnAccessor(buffer)
