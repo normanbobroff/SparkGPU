@@ -41,6 +41,7 @@ object MovieLensALS {
   case class Params(
       input: String = null,
       kryo: Boolean = false,
+      nonnegative: Boolean = false,
       numIterations: Int = 20,
       lambda: Double = 1.0,
       rank: Int = 10,
@@ -65,6 +66,9 @@ object MovieLensALS {
       opt[Unit]("kryo")
         .text("use Kryo serialization")
         .action((_, c) => c.copy(kryo = true))
+      opt[Unit]("nonnegative")
+        .text("nonnegative factorization")
+        .action((_, c) => c.copy(nonnegative = true))
       opt[Int]("numUserBlocks")
         .text(s"number of user blocks, default: ${defaultParams.numUserBlocks} (auto)")
         .action((x, c) => c.copy(numUserBlocks = x))
@@ -137,7 +141,7 @@ object MovieLensALS {
 
     println(s"Got $numRatings ratings from $numUsers users on $numMovies movies.")
 
-    val splits = ratings.randomSplit(Array(0.8, 0.2))
+    val splits = ratings.randomSplit(Array(0.8, 0.2),0)
     val training = splits(0).cache()
     val test = if (params.implicitPrefs) {
       /*
@@ -157,6 +161,8 @@ object MovieLensALS {
     println(s"Training: $numTraining, test: $numTest.")
 
     ratings.unpersist(blocking = false)
+    
+    val start_time = System.currentTimeMillis();
 
     val model = new ALS()
       .setRank(params.rank)
@@ -165,11 +171,19 @@ object MovieLensALS {
       .setImplicitPrefs(params.implicitPrefs)
       .setUserBlocks(params.numUserBlocks)
       .setProductBlocks(params.numProductBlocks)
+      .setNonnegative(params.nonnegative)
       .run(training)
+      
+    val end_time = System.currentTimeMillis();
 
+    printf("ALS.run took %d ms\n", end_time - start_time); 
+	
+    val start_time2 = System.currentTimeMillis();
     val rmse = computeRmse(model, test, params.implicitPrefs)
+    val end_time2 = System.currentTimeMillis();
 
     println(s"Test RMSE = $rmse.")
+    printf("RMSE took %d ms\n", end_time2 - start_time2); 
 
     sc.stop()
   }

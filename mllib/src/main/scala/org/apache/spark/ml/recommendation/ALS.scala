@@ -1203,6 +1203,7 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
           (dstBlockId, (srcBlockId, activeIndices.map(idx => srcFactors(idx))))
         }
     }
+    val use_gpu = srcFactorBlocks.conf.get("spark.mllib.ALS.useGPU", "")
     val merged = srcOut.groupByKey(new ALSPartitioner(dstInBlocks.partitions.length))
     dstInBlocks.join(merged).mapValues {
       case (InBlock(dstIds, srcPtrs, srcEncodedIndices, ratings), srcFactors) =>
@@ -1210,46 +1211,78 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
         srcFactors.foreach { case (srcBlockId, factors) =>
           sortedSrcFactors(srcBlockId) = factors
         }
-        val dstFactors = new Array[Array[Float]](dstIds.length)
+        var dstFactors = new Array[Array[Float]](dstIds.length)
         var j = 0
-        val ls = new NormalEquation(rank)
-        while (j < dstIds.length) {
-          ls.reset()
-          if (implicitPrefs) {
-            ls.merge(YtY.get)
+        // use cuMF kernel and GPU
+        if(!implicitPrefs&&(!use_gpu.isEmpty()))
+        {
+          val libs = use_gpu.split(";")
+          for(i <- 0 until libs.length)
+          {
+            System.load(libs(i))
           }
-          var i = srcPtrs(j)
-          var numExplicits = 0
-          while (i < srcPtrs(j + 1)) {
-            val encoded = srcEncodedIndices(i)
-            val blockId = srcEncoder.blockId(encoded)
-            val localIndex = srcEncoder.localIndex(encoded)
-            val srcFactor = sortedSrcFactors(blockId)(localIndex)
-            val rating = ratings(i)
+          val sortedSrcFactorLength =
+              sortedSrcFactors.map(sortedSrcFactor => sortedSrcFactor.length)
+          val accumulatedSortedSrcFactorLength = sortedSrcFactorLength.scanLeft(0)(_ + _)
+          val csrCol = new Array[Int](srcPtrs.last)
+          while (j < dstIds.length) {
+            var i = srcPtrs(j)
+            while (i < srcPtrs(j + 1)) {
+              val encoded = srcEncodedIndices(i)
+              val blockId = srcEncoder.blockId(encoded)
+              val localIndex = srcEncoder.localIndex(encoded)
+              csrCol(i) = accumulatedSortedSrcFactorLength(blockId) + localIndex
+              i += 1
+            }
+            j += 1
+          }
+        val s = System.nanoTime
+        val jni = new CuMFJNIInterface
+        dstFactors = jni.doALSWithCSR(dstIds.length, accumulatedSortedSrcFactorLength.last, rank,
+           ratings.length, regParam, sortedSrcFactors, srcPtrs, csrCol, ratings)
+        // println("jni.doALSWithCSR takes: " + (System.nanoTime-s)/1e9 + " sec")
+        }
+        else
+        {
+            val ls = new NormalEquation(rank)
+            while (j < dstIds.length) {
+            ls.reset()
             if (implicitPrefs) {
-              // Extension to the original paper to handle b < 0. confidence is a function of |b|
-              // instead so that it is never negative. c1 is confidence - 1.0.
-              val c1 = alpha * math.abs(rating)
-              // For rating <= 0, the corresponding preference is 0. So the term below is only added
-              // for rating > 0. Because YtY is already added, we need to adjust the scaling here.
-              if (rating > 0) {
-                numExplicits += 1
-                ls.add(srcFactor, (c1 + 1.0) / c1, c1)
-              }
-            } else {
+              ls.merge(YtY.get)
+            }
+            var i = srcPtrs(j)
+            var numExplicits = 0
+            while (i < srcPtrs(j + 1)) {
+              val encoded = srcEncodedIndices(i)
+              val blockId = srcEncoder.blockId(encoded)
+              val localIndex = srcEncoder.localIndex(encoded)
+              val srcFactor = sortedSrcFactors(blockId)(localIndex)
+              val rating = ratings(i)
+              if (implicitPrefs) {
+                // Extension to the original paper to handle b < 0. confidence is a function of |b|
+                // instead so that it is never negative. c1 is confidence - 1.0.
+                val c1 = alpha * math.abs(rating)
+                // For rating <= 0, the corresponding preference is 0.
+                // So the term below is only added
+                // for rating > 0. Because YtY is already added, we need to adjust the scaling here.
+                if (rating > 0) {
+                  numExplicits += 1
+                  ls.add(srcFactor, (c1 + 1.0) / c1, c1)
+                }
+              } else {
               ls.add(srcFactor, rating)
               numExplicits += 1
+              }
+              i += 1
             }
-            i += 1
+            // Weight lambda by the number of explicit ratings based on the ALS-WR paper.
+            dstFactors(j) = solver.solve(ls, numExplicits * regParam)
+            j += 1
           }
-          // Weight lambda by the number of explicit ratings based on the ALS-WR paper.
-          dstFactors(j) = solver.solve(ls, numExplicits * regParam)
-          j += 1
         }
         dstFactors
     }
   }
-
   /**
    * Computes the Gramian matrix of user or item factors, which is only used in implicit preference.
    * Caching of the input factors is handled in [[ALS#train]].
