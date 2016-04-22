@@ -24,7 +24,7 @@ import breeze.optimize.{CachedDiffFunction, DiffFunction, LBFGS => BreezeLBFGS}
 
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.internal.Logging
-import org.apache.spark.mllib.linalg.{Vector, Vectors}
+import org.apache.spark.mllib.linalg.{DenseVector, Vector, Vectors}
 import org.apache.spark.mllib.linalg.BLAS.axpy
 import org.apache.spark.rdd.RDD
 
@@ -181,6 +181,50 @@ object LBFGS extends Logging {
    *         computed for every iteration.
    */
   def runLBFGS(
+      data: RDD[(Double, Vector)],
+      gradient: Gradient,
+      updater: Updater,
+      numCorrections: Int,
+      convergenceTol: Double,
+      maxNumIterations: Int,
+      regParam: Double,
+      initialWeights: Vector): (Vector, Array[Double]) = {
+
+    if (data.context.getConf.get("spark.mllib.LBFGS.useGPU", "false").toBoolean) {
+      // GPU implementation
+      val dataAsArray = data.map( s => Array.concat(Array.apply(s._1), s._2.toArray)).collect
+
+      var numFeatures = data.first()._2.size
+
+      val lossHistoryArraySize = 20
+      val lossHistoryArray = new Array[Double](lossHistoryArraySize)
+
+      // Resulting optimal weights
+      val weights = new Array[Double](numFeatures)
+
+      // Real work
+      System.loadLibrary("GPULBFGS")
+      val nativeLBFGS = new NativeLBFGS
+      nativeLBFGS.runNativeLBFGS(dataAsArray, convergenceTol, regParam,
+                                 weights,
+                                 lossHistoryArray, lossHistoryArraySize,
+                                 maxNumIterations)
+
+      logInfo("LBFGS.runLBFGS finished on GPU. Last 10 losses %s".format(
+        lossHistoryArray.takeRight(10).mkString(", ")))
+
+      (new DenseVector(weights), lossHistoryArray)
+    }
+    else {
+      runLBFGSCPU(data, gradient, updater, numCorrections, convergenceTol,
+        maxNumIterations, regParam, initialWeights)
+    }
+  }
+
+  /**
+   *  Original CPU implementation
+   */
+  private def runLBFGSCPU(
       data: RDD[(Double, Vector)],
       gradient: Gradient,
       updater: Updater,

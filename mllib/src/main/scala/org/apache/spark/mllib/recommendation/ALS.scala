@@ -237,45 +237,133 @@ class ALS private (
   def run(ratings: RDD[Rating]): MatrixFactorizationModel = {
     val sc = ratings.context
 
-    val numUserBlocks = if (this.numUserBlocks == -1) {
-      math.max(sc.defaultParallelism, ratings.partitions.length / 2)
-    } else {
-      this.numUserBlocks
-    }
-    val numProductBlocks = if (this.numProductBlocks == -1) {
-      math.max(sc.defaultParallelism, ratings.partitions.length / 2)
-    } else {
-      this.numProductBlocks
-    }
+    val use_gpu = System.getenv("SPARK_GPU")
 
-    val (floatUserFactors, floatProdFactors) = NewALS.train[Int](
-      ratings = ratings.map(r => NewALS.Rating(r.user, r.product, r.rating.toFloat)),
-      rank = rank,
-      numUserBlocks = numUserBlocks,
-      numItemBlocks = numProductBlocks,
-      maxIter = iterations,
-      regParam = lambda,
-      implicitPrefs = implicitPrefs,
-      alpha = alpha,
-      nonnegative = nonnegative,
-      intermediateRDDStorageLevel = intermediateRDDStorageLevel,
-      finalRDDStorageLevel = StorageLevel.NONE,
-      checkpointInterval = checkpointInterval,
-      seed = seed)
+    if (implicitPrefs || nonnegative || use_gpu == null ) {
 
-    val userFactors = floatUserFactors
-      .mapValues(_.map(_.toDouble))
-      .setName("users")
-      .persist(finalRDDStorageLevel)
-    val prodFactors = floatProdFactors
-      .mapValues(_.map(_.toDouble))
-      .setName("products")
-      .persist(finalRDDStorageLevel)
-    if (finalRDDStorageLevel != StorageLevel.NONE) {
-      userFactors.count()
-      prodFactors.count()
+      val numUserBlocks = if (this.numUserBlocks == -1) {
+        math.max(sc.defaultParallelism, ratings.partitions.length / 2)
+      } else {
+        this.numUserBlocks
+      }
+      val numProductBlocks = if (this.numProductBlocks == -1) {
+        math.max(sc.defaultParallelism, ratings.partitions.length / 2)
+      } else {
+        this.numProductBlocks
+      }
+
+      val (floatUserFactors, floatProdFactors) = NewALS.train[Int](
+        ratings = ratings.map(r => NewALS.Rating(r.user, r.product, r.rating.toFloat)),
+        rank = rank,
+        numUserBlocks = numUserBlocks,
+        numItemBlocks = numProductBlocks,
+        maxIter = iterations,
+        regParam = lambda,
+        implicitPrefs = implicitPrefs,
+        alpha = alpha,
+        nonnegative = nonnegative,
+        intermediateRDDStorageLevel = intermediateRDDStorageLevel,
+        finalRDDStorageLevel = StorageLevel.NONE,
+        checkpointInterval = checkpointInterval,
+        seed = seed)
+
+      val userFactors = floatUserFactors
+        .mapValues(_.map(_.toDouble))
+        .setName("users")
+        .persist(finalRDDStorageLevel)
+      val prodFactors = floatProdFactors
+        .mapValues(_.map(_.toDouble))
+        .setName("products")
+        .persist(finalRDDStorageLevel)
+      if (finalRDDStorageLevel != StorageLevel.NONE) {
+        userFactors.count()
+        prodFactors.count()
+      }
+      new MatrixFactorizationModel(rank, userFactors, prodFactors)
+    } else {
+
+      val start_time = System.currentTimeMillis();
+    
+      System.load(use_gpu)
+    
+      printf("ALS.run.train cp0 took %d ms\n", System.currentTimeMillis() - start_time);
+
+      val num_rating = ratings.count().toInt
+      val num_user = ratings.map(_.user).distinct().count().toInt
+      val num_prod = ratings.map(_.product).distinct().count().toInt
+
+      printf("ALS.run.train cp1 took %d ms\n", System.currentTimeMillis() - start_time);
+     
+      var row_idx = new Array[Int](num_rating)
+      var col_idx = new Array[Int](num_rating)
+      var rating = new Array[Float](num_rating)
+      var index = 0
+      
+      printf("ALS.run.train cp2 took %d ms\n", System.currentTimeMillis() - start_time)
+
+      ratings.collect().foreach { x =>
+        row_idx(index) = x.user
+        col_idx(index) = x.product
+        rating(index) = x.rating.toFloat
+        index = index + 1
+      }
+
+      printf("ALS.run.train cp3 took %d ms\n", System.currentTimeMillis() - start_time)
+     
+      ////////////////////////////////////////////////////////////////////////
+      // call external algorithm
+      ////////////////////////////////////////////////////////////////////////
+
+      var engine = new gpuALS
+
+      printf("ALS.run.train cp4 took %d ms\n", System.currentTimeMillis() - start_time)
+      engine.factorize(rank,num_user,num_prod,num_rating,row_idx,col_idx,rating,lambda,iterations)
+      
+      printf("ALS.run.train cp5 took %d ms\n", System.currentTimeMillis() - start_time)
+
+      val user = engine.getUser()
+      val prod = engine.getProd()
+
+
+      printf("ALS.run.train cp6 took %d ms\n", System.currentTimeMillis() - start_time)
+
+      ////////////////////////////////////////////////////////////////////////
+      // retrieve result
+      ////////////////////////////////////////////////////////////////////////
+
+      var user_arr = new Array[(Int, Array[Double])](num_user.toInt)
+      var prod_arr = new Array[(Int, Array[Double])](num_prod.toInt)
+      
+      printf("ALS.run.train cp7 took %d ms\n", System.currentTimeMillis() - start_time)
+
+      for (i <- 0 until num_user.toInt) {
+        var data = user.slice(i * rank, (i + 1) * rank).map {_.toDouble }        
+        user_arr.update(i, (i, data))
+      }
+
+      for (i <- 0 until num_prod.toInt) {
+        val data = prod.slice(i * rank, (i + 1) * rank).map {_.toDouble }        
+        prod_arr.update(i, (i, data))
+      }
+      
+      printf("ALS.run.train cp8 took %d ms\n", System.currentTimeMillis() - start_time)
+
+      var userFactors = sc.parallelize(user_arr).setName("users")
+        .persist(finalRDDStorageLevel)
+      var prodFactors = sc.parallelize(prod_arr).setName("products")
+        .persist(finalRDDStorageLevel)
+        
+      printf("ALS.run.train cp9 took %d ms\n", System.currentTimeMillis() - start_time)
+
+      if (finalRDDStorageLevel != StorageLevel.NONE) {
+        userFactors.count()
+        prodFactors.count()
+      }
+
+      printf("ALS.run.train cp10 took %d ms\n", System.currentTimeMillis() - start_time);
+      
+      new MatrixFactorizationModel(rank, userFactors, prodFactors)
     }
-    new MatrixFactorizationModel(rank, userFactors, prodFactors)
   }
 
   /**

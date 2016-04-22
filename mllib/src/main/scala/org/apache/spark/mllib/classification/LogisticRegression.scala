@@ -66,6 +66,9 @@ class LogisticRegressionModel @Since("1.3.0") (
       s" but was given weights of length ${weights.size}")
   }
 
+  private val useGPU: Boolean = SparkContext.getOrCreate().getConf
+    .get("spark.mllib.LogisticRegression.useGPU", "false").toBoolean
+
   private val dataWithBiasSize: Int = weights.size / (numClasses - 1)
 
   private val weightsArray: Array[Double] = weights match {
@@ -110,6 +113,46 @@ class LogisticRegressionModel @Since("1.3.0") (
   def clearThreshold(): this.type = {
     threshold = None
     this
+  }
+
+  override def predict(testData: RDD[Vector]): RDD[Double] = {
+    // A small optimization to avoid serializing the entire model. Only the weightsMatrix
+    // and intercept is needed.
+    val localIntercept = intercept
+
+    if (useGPU) {
+      val localWeights = weights.toArray
+      val bcWeights = testData.context.broadcast(localWeights)
+      testData.mapPartitions { iter =>
+        val w = bcWeights.value
+        // TODO: move loadLibrary to an earlier time, and run it only once
+        System.loadLibrary("LogisticRegressionNative")
+        val gpu = new LogisticRegressionNative
+        // TODO it would be better to copy w only once to the GPU, since it doesn't change,
+        // instead of with each iteration.  But different iterations will run on different GPUs
+        // (if present), so this needs careful consideration
+        iter.map(v => gpu.predictPoint(v.toArray, w, localIntercept))
+      }
+    } else {
+      val localWeights = weights
+      val bcWeights = testData.context.broadcast(localWeights)
+
+      testData.mapPartitions { iter =>
+        val w = bcWeights.value
+        iter.map(v => predictPoint(v, w, localIntercept))
+      }
+    }
+  }
+
+  override def predict(testData: Vector): Double = {
+    if (useGPU) {
+      // TODO: move loadLibrary to an earlier time
+      System.loadLibrary("LogisticRegressionNative")
+      val gpu = new LogisticRegressionNative
+      gpu.predictPoint(testData.toArray, weights.toArray, intercept)
+    } else {
+      predictPoint(testData, weights, intercept)
+    }
   }
 
   override protected def predictPoint(
