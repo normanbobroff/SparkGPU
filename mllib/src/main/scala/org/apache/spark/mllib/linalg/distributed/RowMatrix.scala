@@ -405,6 +405,9 @@ class RowMatrix @Since("1.0.0") (
    */
   @Since("1.0.0")
   def computePrincipalComponents(k: Int): Matrix = {
+    
+  println( " ******** Hello Norm ********** \n");
+
     computePrincipalComponentsAndExplainedVariance(k)._1
   }
 
